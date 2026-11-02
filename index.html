@@ -7,6 +7,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>香港實時交通及分區天氣看板</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- SQLite WebAssembly 解析器 (用於讀取 7 個港鐵/輕鐵 .db/.sqlite 檔案) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800;900&family=JetBrains+Mono:wght@600;700;800&family=Noto+Sans+HK:wght@500;700;900&family=Roboto:wght@500;700;900&display=swap');
 
@@ -1911,6 +1913,435 @@
     }
 
     // =========================================================================
+    // 9.5 港鐵 / 輕鐵官方 SQLite 資料庫解析與持久化模組
+    // =========================================================================
+    window.MTR_SQLITE_DB = {
+      loaded: false,
+      idToAlias: {},
+      aliasToId: {},
+      stations: {},
+      cplanner: {},
+      transfers: {},
+      exits: {},
+      stationPlatform: {},
+      platformDir: {},
+      lrtStations: {},
+      lrtFares: {},
+      lrtJourneys: {}
+    };
+
+    function normalizeMtrLineCode(code) {
+      if (!code) return '';
+      const c = String(code).trim().toUpperCase();
+      if (c === 'WRL' || c === 'MOL') return 'TML';
+      return c;
+    }
+
+    function pickCol(row, ...candidates) {
+      const keys = Object.keys(row);
+      for (const cand of candidates) {
+        const exact = keys.find(k => k.toLowerCase() === cand.toLowerCase());
+        if (exact !== undefined && row[exact] !== null && row[exact] !== '') return row[exact];
+      }
+      const partial = keys.find(k => candidates.some(c => k.toLowerCase().includes(c.toLowerCase())));
+      return partial !== undefined ? row[partial] : null;
+    }
+
+    function queryTableToObjects(db, tableName) {
+      try {
+        const res = db.exec(`SELECT * FROM "${tableName}"`);
+        if (!res || !res.length) return [];
+        const { columns, values } = res[0];
+        return values.map(row => {
+          const obj = {};
+          columns.forEach((col, i) => { obj[col] = row[i]; });
+          return obj;
+        });
+      } catch (e) {
+        return [];
+      }
+    }
+
+    async function handleMtrSqliteFiles(fileList) {
+      if (!fileList || !fileList.length) return;
+      const statusEl = document.getElementById('mtrSqliteStatus');
+      if (statusEl) statusEl.textContent = `⏳ 正在解析 ${fileList.length} 個資料庫檔案...`;
+
+      try {
+        const SQL = await initSqlJs({
+          locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}`
+        });
+
+        const dbs = [];
+        for (const file of fileList) {
+          const buf = await file.arrayBuffer();
+          const db = new SQL.Database(new Uint8Array(buf));
+          const tablesRes = db.exec("SELECT name FROM sqlite_master WHERE type='table'");
+          const tables = tablesRes.length ? tablesRes[0].values.map(v => v[0]) : [];
+          dbs.push({ db, tables });
+        }
+
+        for (const item of dbs) {
+          if (item.tables.includes('STATIONS')) {
+            queryTableToObjects(item.db, 'STATIONS').forEach(r => {
+              const id = String(pickCol(r, 'STATION_ID', 'ID') ?? '').trim();
+              const alias = String(pickCol(r, 'ALIAS', 'CODE') ?? '').trim().toUpperCase();
+              if (id && alias) {
+                MTR_SQLITE_DB.idToAlias[id] = alias;
+                MTR_SQLITE_DB.aliasToId[alias] = id;
+                MTR_SQLITE_DB.stations[alias] = {
+                  id, alias,
+                  nameZh: pickCol(r, 'NAME_CH', 'CHINESE_NAME', 'NAME_TC') || '',
+                  nameEn: pickCol(r, 'NAME_EN', 'ENGLISH_NAME') || ''
+                };
+              }
+            });
+          }
+        }
+
+        for (const { db, tables } of dbs) {
+          if (tables.includes('Transfer')) {
+            queryTableToObjects(db, 'Transfer').forEach(r => {
+              const rawSt = String(pickCol(r, 'StationID', 'Station') ?? '').trim();
+              const stKey = MTR_SQLITE_DB.idToAlias[rawSt] || rawSt.toUpperCase();
+              if (!MTR_SQLITE_DB.transfers[stKey]) MTR_SQLITE_DB.transfers[stKey] = [];
+              MTR_SQLITE_DB.transfers[stKey].push({
+                fromLine: normalizeMtrLineCode(pickCol(r, 'FromLine', 'Line')),
+                toLine: normalizeMtrLineCode(pickCol(r, 'ToLine', 'TransferLine', 'TargetLine')),
+                dir: pickCol(r, 'Direction', 'Dir'),
+                platform: pickCol(r, 'Platform', 'Plat'),
+                car: pickCol(r, 'Car', 'Carriage'),
+                door: pickCol(r, 'Door'),
+                lift: pickCol(r, 'Lift'),
+                escalator: pickCol(r, 'Escalator')
+              });
+            });
+          }
+
+          if (tables.includes('Exit')) {
+            queryTableToObjects(db, 'Exit').forEach(r => {
+              const rawSt = String(pickCol(r, 'StationID', 'Station') ?? '').trim();
+              const stKey = MTR_SQLITE_DB.idToAlias[rawSt] || rawSt.toUpperCase();
+              if (!MTR_SQLITE_DB.exits[stKey]) MTR_SQLITE_DB.exits[stKey] = [];
+              MTR_SQLITE_DB.exits[stKey].push({
+                exit: pickCol(r, 'Exit', 'ExitCode'),
+                line: normalizeMtrLineCode(pickCol(r, 'Line')),
+                dir: pickCol(r, 'Direction', 'Dir'),
+                platform: pickCol(r, 'Platform'),
+                car: pickCol(r, 'Car'),
+                door: pickCol(r, 'Door'),
+                lift: pickCol(r, 'Lift'),
+                escalator: pickCol(r, 'Escalator')
+              });
+            });
+          }
+
+          if (tables.includes('cplanner_index')) {
+            queryTableToObjects(db, 'cplanner_index').forEach(r => {
+              const sId = String(pickCol(r, 'startid', 'start_id') ?? '').trim();
+              const dId = String(pickCol(r, 'destinid', 'dest_id') ?? '').trim();
+              if (!sId || !dId) return;
+              MTR_SQLITE_DB.cplanner[`${sId}_${dId}`] = {
+                route: pickCol(r, 'route'),
+                chgTime: Number(pickCol(r, 'chg_time', 'time') || 0),
+                octAdult: parseFloat(pickCol(r, 'oct_adult', 'adult_oct') ?? 0),
+                octConc: parseFloat(pickCol(r, 'oct_concessionary', 'oct_conc') ?? 0),
+                octStudent: parseFloat(pickCol(r, 'oct_student', 'student_oct') ?? 0),
+                octChild: parseFloat(pickCol(r, 'oct_child', 'child_oct') ?? 0),
+                octElderly: parseFloat(pickCol(r, 'oct_elderly', 'elderly_oct') ?? 0),
+                singleAdult: parseFloat(pickCol(r, 'sj_adult', 'single_adult') ?? 0),
+                singleConc: parseFloat(pickCol(r, 'sj_concessionary', 'single_conc') ?? 0),
+                fcAdult: parseFloat(pickCol(r, 'fc_oct_adult', 'fc_adult') ?? 0),
+                fcConc: parseFloat(pickCol(r, 'fc_oct_concessionary', 'fc_conc') ?? 0)
+              };
+            });
+          }
+
+          if (tables.includes('lrjp_fare')) {
+            queryTableToObjects(db, 'lrjp_fare').forEach(r => {
+              const sId = String(pickCol(r, 'start_id', 'from_id', 'startid') ?? '').trim();
+              const dId = String(pickCol(r, 'dest_id', 'to_id', 'destinid') ?? '').trim();
+              if (!sId || !dId) return;
+              MTR_SQLITE_DB.lrtFares[`${sId}_${dId}`] = {
+                octAdult: parseFloat(pickCol(r, 'oct_adult', 'adult_oct') ?? 0),
+                octConc: parseFloat(pickCol(r, 'oct_child', 'oct_conc') ?? 0),
+                octElderly: parseFloat(pickCol(r, 'oct_elderly', 'elderly_oct') ?? 0),
+                octStudent: parseFloat(pickCol(r, 'oct_student', 'student_oct') ?? 0),
+                singleAdult: parseFloat(pickCol(r, 'sj_adult', 'single_adult') ?? 0),
+                singleConc: parseFloat(pickCol(r, 'sj_child', 'single_conc') ?? 0)
+              };
+            });
+          }
+
+          if (tables.includes('lrjp_journey')) {
+            queryTableToObjects(db, 'lrjp_journey').forEach(r => {
+              const sId = String(pickCol(r, 'start_id', 'from_id', 'startid') ?? '').trim();
+              const dId = String(pickCol(r, 'dest_id', 'to_id', 'destinid') ?? '').trim();
+              if (!sId || !dId) return;
+              MTR_SQLITE_DB.lrtJourneys[`${sId}_${dId}`] = {
+                route: pickCol(r, 'route', 'routes'),
+                time: Number(pickCol(r, 'time', 'journey_time') || 0)
+              };
+            });
+          }
+
+          if (tables.includes('station_platform')) {
+            queryTableToObjects(db, 'station_platform').forEach(r => {
+              const fId = String(pickCol(r, 'from_station_id') ?? '').trim();
+              const tId = String(pickCol(r, 'to_station_id') ?? '').trim();
+              const plat = pickCol(r, 'from_platform', 'platform');
+              if (fId && tId && plat !== null) {
+                MTR_SQLITE_DB.stationPlatform[`${fId}_${tId}`] = String(plat);
+              }
+            });
+          }
+
+          db.close();
+        }
+
+        MTR_SQLITE_DB.loaded = true;
+        await saveSqliteDataToIndexedDB(MTR_SQLITE_DB);
+
+        if (statusEl) {
+          statusEl.textContent = `✅ 載入成功！重鐵路線 ${Object.keys(MTR_SQLITE_DB.cplanner).length} 筆、轉乘 ${Object.keys(MTR_SQLITE_DB.transfers).length} 站、輕鐵車費 ${Object.keys(MTR_SQLITE_DB.lrtFares).length} 筆`;
+        }
+      } catch (err) {
+        console.error(err);
+        if (statusEl) statusEl.textContent = `❌ 匯入失敗：${err.message}`;
+      }
+    }
+
+    function openMtrIdb() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open('MtrOfficialSqliteCacheDB', 1);
+        req.onupgradeneeded = e => e.target.result.createObjectStore('sqliteStore');
+        req.onsuccess = e => resolve(e.target.result);
+        req.onerror = e => reject(e.target.error);
+      });
+    }
+
+    async function saveSqliteDataToIndexedDB(data) {
+      const db = await openMtrIdb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('sqliteStore', 'readwrite');
+        tx.objectStore('sqliteStore').put(data, 'MTR_SQLITE_DB');
+        tx.oncomplete = () => resolve();
+        tx.onerror = e => reject(e.target.error);
+      });
+    }
+
+    // 定義 GitHub 專案內 mtr_db 資料夾的 7 個 SQLite 檔案原始路徑
+    const MTR_SQLITE_FILE_PATHS = [
+      'mtr_db/E_Station.db',            // 先載入 STATIONS 建立 ID 與代碼映射
+      'mtr_db/E_station_platform.db',   // 月台與行車方向
+      'mtr_db/E_JP.db',                 // 重鐵路線規劃與車費
+      'mtr_db/JPIntchgSourceResult.db', // 轉乘站編程映射
+      'mtr_db/JPPlatform.db',           // 月台顯示映射
+      'mtr_db/Transfer.db',             // 轉乘車廂與出入口 (若你的檔名不同請改為實際檔名)
+      'mtr_db/lrjp.db'                  // 輕鐵路網 (若你的檔名不同請改為實際檔名)
+    ];
+
+    // 自動從專案資料夾 fetch 下載並解析
+    async function autoFetchAndLoadSqliteFiles() {
+      const statusEl = document.getElementById('mtrSqliteStatus');
+      if (statusEl) statusEl.textContent = '⏳ 正在從專案載入官方 SQLite 資料庫...';
+
+      try {
+        const SQL = await initSqlJs({
+          locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}`
+        });
+
+        const fileBuffers = [];
+        for (const path of MTR_SQLITE_FILE_PATHS) {
+          const res = await fetch(path);
+          if (!res.ok) throw new Error(`找不到檔案: ${path} (HTTP ${res.status})`);
+          const buf = await res.arrayBuffer();
+          fileBuffers.push(buf);
+        }
+
+        const dbs = fileBuffers.map(buf => {
+          const db = new SQL.Database(new Uint8Array(buf));
+          const tablesRes = db.exec("SELECT name FROM sqlite_master WHERE type='table'");
+          const tables = tablesRes.length ? tablesRes[0].values.map(v => v[0]) : [];
+          return { db, tables };
+        });
+
+        // 1. 先處理 STATIONS 表
+        for (const item of dbs) {
+          if (item.tables.includes('STATIONS')) {
+            queryTableToObjects(item.db, 'STATIONS').forEach(r => {
+              const id = String(pickCol(r, 'STATION_ID', 'ID') ?? '').trim();
+              const alias = String(pickCol(r, 'ALIAS', 'CODE') ?? '').trim().toUpperCase();
+              if (id && alias) {
+                MTR_SQLITE_DB.idToAlias[id] = alias;
+                MTR_SQLITE_DB.aliasToId[alias] = id;
+                MTR_SQLITE_DB.stations[alias] = {
+                  id, alias,
+                  nameZh: pickCol(r, 'NAME_CH', 'CHINESE_NAME', 'NAME_TC') || '',
+                  nameEn: pickCol(r, 'NAME_EN', 'ENGLISH_NAME') || ''
+                };
+              }
+            });
+          }
+        }
+
+        // 2. 處理其餘資料表
+        for (const { db, tables } of dbs) {
+          if (tables.includes('Transfer')) {
+            queryTableToObjects(db, 'Transfer').forEach(r => {
+              const rawSt = String(pickCol(r, 'StationID', 'Station') ?? '').trim();
+              const stKey = MTR_SQLITE_DB.idToAlias[rawSt] || rawSt.toUpperCase();
+              if (!MTR_SQLITE_DB.transfers[stKey]) MTR_SQLITE_DB.transfers[stKey] = [];
+              MTR_SQLITE_DB.transfers[stKey].push({
+                fromLine: normalizeMtrLineCode(pickCol(r, 'FromLine', 'Line')),
+                toLine: normalizeMtrLineCode(pickCol(r, 'ToLine', 'TransferLine', 'TargetLine')),
+                dir: pickCol(r, 'Direction', 'Dir'),
+                platform: pickCol(r, 'Platform', 'Plat'),
+                car: pickCol(r, 'Car', 'Carriage'),
+                door: pickCol(r, 'Door'),
+                lift: pickCol(r, 'Lift'),
+                escalator: pickCol(r, 'Escalator')
+              });
+            });
+          }
+
+          if (tables.includes('Exit')) {
+            queryTableToObjects(db, 'Exit').forEach(r => {
+              const rawSt = String(pickCol(r, 'StationID', 'Station') ?? '').trim();
+              const stKey = MTR_SQLITE_DB.idToAlias[rawSt] || rawSt.toUpperCase();
+              if (!MTR_SQLITE_DB.exits[stKey]) MTR_SQLITE_DB.exits[stKey] = [];
+              MTR_SQLITE_DB.exits[stKey].push({
+                exit: pickCol(r, 'Exit', 'ExitCode'),
+                line: normalizeMtrLineCode(pickCol(r, 'Line')),
+                dir: pickCol(r, 'Direction', 'Dir'),
+                platform: pickCol(r, 'Platform'),
+                car: pickCol(r, 'Car'),
+                door: pickCol(r, 'Door'),
+                lift: pickCol(r, 'Lift'),
+                escalator: pickCol(r, 'Escalator')
+              });
+            });
+          }
+
+          if (tables.includes('cplanner_index')) {
+            queryTableToObjects(db, 'cplanner_index').forEach(r => {
+              const sId = String(pickCol(r, 'startid', 'start_id') ?? '').trim();
+              const dId = String(pickCol(r, 'destinid', 'dest_id') ?? '').trim();
+              if (!sId || !dId) return;
+              MTR_SQLITE_DB.cplanner[`${sId}_${dId}`] = {
+                route: pickCol(r, 'route'),
+                chgTime: Number(pickCol(r, 'chg_time', 'time') || 0),
+                octAdult: parseFloat(pickCol(r, 'oct_adult', 'adult_oct') ?? 0),
+                octConc: parseFloat(pickCol(r, 'oct_concessionary', 'oct_conc') ?? 0),
+                octStudent: parseFloat(pickCol(r, 'oct_student', 'student_oct') ?? 0),
+                octChild: parseFloat(pickCol(r, 'oct_child', 'child_oct') ?? 0),
+                octElderly: parseFloat(pickCol(r, 'oct_elderly', 'elderly_oct') ?? 0),
+                singleAdult: parseFloat(pickCol(r, 'sj_adult', 'single_adult') ?? 0),
+                singleConc: parseFloat(pickCol(r, 'sj_concessionary', 'single_conc') ?? 0),
+                fcAdult: parseFloat(pickCol(r, 'fc_oct_adult', 'fc_adult') ?? 0),
+                fcConc: parseFloat(pickCol(r, 'fc_oct_concessionary', 'fc_conc') ?? 0)
+              };
+            });
+          }
+
+          if (tables.includes('lrjp_fare')) {
+            queryTableToObjects(db, 'lrjp_fare').forEach(r => {
+              const sId = String(pickCol(r, 'start_id', 'from_id', 'startid') ?? '').trim();
+              const dId = String(pickCol(r, 'dest_id', 'to_id', 'destinid') ?? '').trim();
+              if (!sId || !dId) return;
+              MTR_SQLITE_DB.lrtFares[`${sId}_${dId}`] = {
+                octAdult: parseFloat(pickCol(r, 'oct_adult', 'adult_oct') ?? 0),
+                octConc: parseFloat(pickCol(r, 'oct_child', 'oct_conc') ?? 0),
+                octElderly: parseFloat(pickCol(r, 'oct_elderly', 'elderly_oct') ?? 0),
+                octStudent: parseFloat(pickCol(r, 'oct_student', 'student_oct') ?? 0),
+                singleAdult: parseFloat(pickCol(r, 'sj_adult', 'single_adult') ?? 0),
+                singleConc: parseFloat(pickCol(r, 'sj_child', 'single_conc') ?? 0)
+              };
+            });
+          }
+
+          if (tables.includes('lrjp_journey')) {
+            queryTableToObjects(db, 'lrjp_journey').forEach(r => {
+              const sId = String(pickCol(r, 'start_id', 'from_id', 'startid') ?? '').trim();
+              const dId = String(pickCol(r, 'dest_id', 'to_id', 'destinid') ?? '').trim();
+              if (!sId || !dId) return;
+              MTR_SQLITE_DB.lrtJourneys[`${sId}_${dId}`] = {
+                route: pickCol(r, 'route', 'routes'),
+                time: Number(pickCol(r, 'time', 'journey_time') || 0)
+              };
+            });
+          }
+
+          if (tables.includes('station_platform')) {
+            queryTableToObjects(db, 'station_platform').forEach(r => {
+              const fId = String(pickCol(r, 'from_station_id') ?? '').trim();
+              const tId = String(pickCol(r, 'to_station_id') ?? '').trim();
+              const plat = pickCol(r, 'from_platform', 'platform');
+              if (fId && tId && plat !== null) {
+                MTR_SQLITE_DB.stationPlatform[`${fId}_${tId}`] = String(plat);
+              }
+            });
+          }
+
+          db.close();
+        }
+
+        MTR_SQLITE_DB.loaded = true;
+        await saveSqliteDataToIndexedDB(MTR_SQLITE_DB);
+        if (statusEl) {
+          statusEl.textContent = `✅ 官方資料庫已自動載入（重鐵 ${Object.keys(MTR_SQLITE_DB.cplanner).length} 條、輕鐵 ${Object.keys(MTR_SQLITE_DB.lrtFares).length} 條）`;
+        }
+      } catch (err) {
+        console.warn('自動載入失敗:', err);
+        if (statusEl) statusEl.textContent = `⚠️ 自動載入失敗：${err.message}`;
+      }
+    }
+
+    // 頁面啟動載入機制：優先讀取快取，若無快取則自動從 mtr_db 抓取
+    async function loadSqliteDataFromIndexedDB() {
+      try {
+        const db = await openMtrIdb();
+        const tx = db.transaction('sqliteStore', 'readonly');
+        const req = tx.objectStore('sqliteStore').get('MTR_SQLITE_DB');
+        req.onsuccess = async () => {
+          if (req.result && req.result.loaded) {
+            window.MTR_SQLITE_DB = req.result;
+            const statusEl = document.getElementById('mtrSqliteStatus');
+            if (statusEl) {
+              statusEl.textContent = `✅ 已從快取載入官方資料庫（${Object.keys(MTR_SQLITE_DB.cplanner).length} 筆重鐵紀錄）`;
+            }
+          } else {
+            await autoFetchAndLoadSqliteFiles();
+          }
+        };
+        req.onerror = () => autoFetchAndLoadSqliteFiles();
+      } catch (_) {
+        autoFetchAndLoadSqliteFiles();
+      }
+    }
+
+    async function clearMtrSqliteCache() {
+      const db = await openMtrIdb();
+      const tx = db.transaction('sqliteStore', 'readwrite');
+      tx.objectStore('sqliteStore').delete('MTR_SQLITE_DB');
+      window.MTR_SQLITE_DB.loaded = false;
+      const statusEl = document.getElementById('mtrSqliteStatus');
+      if (statusEl) statusEl.textContent = '狀態：已清除官方 SQLite 快取';
+    }
+
+    function exportSqliteToStaticJs() {
+      if (!window.MTR_SQLITE_DB?.loaded) {
+        alert('請先點擊「1. 選取 7 個檔案匯入」！');
+        return;
+      }
+      const blob = new Blob([`window.MTR_SQLITE_DB = ${JSON.stringify(window.MTR_SQLITE_DB)};\n`], { type: 'application/javascript;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'mtr_sqlite_data.js';
+      a.click();
+    }
+
+    // =========================================================================
     // 10. 行程動態導航追蹤引擎 & 跨交通行程規劃器 (全票種 + 東鐵頭等 + 靜態車卡表版)
     // =========================================================================
 
@@ -2499,9 +2930,48 @@
           const iTo = lineData.stations.findIndex(s => s.id === leg.toId);
           bound = (iTo >= iFrom) ? 'UP' : 'DOWN';
         }
+
+        // 1. 優先從手動自訂表格 CUSTOM_CAR_DOOR_TABLE 讀取
         const keySpecific = `${leg.line}_${leg.toId}_${bound}_${purpose}`;
         const keyFallback = `${leg.line}_${leg.toId}_${bound}_EXIT`;
-        const entry = CUSTOM_CAR_DOOR_TABLE[keySpecific] || CUSTOM_CAR_DOOR_TABLE[keyFallback] || null;
+        const customEntry = CUSTOM_CAR_DOOR_TABLE[keySpecific] || CUSTOM_CAR_DOOR_TABLE[keyFallback] || null;
+
+        let car = customEntry ? customEntry.car : null;
+        let door = customEntry ? customEntry.door : null;
+        let note = customEntry ? customEntry.note : null;
+
+        // 2. 若無手動設定，自動向官方 SQLite 資料庫查詢 Transfer / Exit
+        if (!car && window.MTR_SQLITE_DB?.loaded) {
+          const targetAlias = leg.toId;
+          const nextLeg = legs[idx + 1];
+          const nextLine = nextLeg ? normalizeMtrLineCode(nextLeg.line) : null;
+          const transferList = MTR_SQLITE_DB.transfers[targetAlias] || [];
+          const exitList = MTR_SQLITE_DB.exits[targetAlias] || [];
+
+          if (!isFinal && transferList.length > 0) {
+            const matched = transferList.find(t => (!t.fromLine || t.fromLine === normalizeMtrLineCode(leg.line)) && (!t.toLine || t.toLine === nextLine)) || transferList[0];
+            if (matched && matched.car) {
+              car = Number(matched.car);
+              door = matched.door || null;
+              note = `官方轉乘建議：往 ${matched.toLine || '轉乘綫'} 月台 ${matched.platform || ''}`;
+            }
+          } else if (isFinal && exitList.length > 0) {
+            const matched = exitList.find(e => !e.line || e.line === normalizeMtrLineCode(leg.line)) || exitList[0];
+            if (matched && matched.car) {
+              car = Number(matched.car);
+              door = matched.door || null;
+              note = `官方出閘建議：近 ${matched.exit || ''} 出口`;
+            }
+          }
+
+          // 東鐵綫 (EAL) 強制避開第 4/6 卡頭等車廂
+          if (normalizeMtrLineCode(leg.line) === 'EAL' && (car === 4 || car === 6)) {
+            car = car === 4 ? 3 : 7;
+            door = null;
+            note += ' (已自動改推相鄰普通等車廂)';
+          }
+        }
+
         return {
           line: leg.line,
           lineName: leg.lineName,
@@ -2511,9 +2981,9 @@
           toName: leg.to,
           bound,
           isFinal,
-          car: entry ? entry.car : null,
-          door: entry ? entry.door : null,
-          note: entry ? entry.note : `尚未於 CUSTOM_CAR_DOOR_TABLE 設定 (${keySpecific})`
+          car,
+          door,
+          note: note || `尚未設定此站車卡位置 (${keySpecific})`
         };
       });
     }
@@ -2617,6 +3087,54 @@
       if (origId === destId) {
         return { isExact: true, adult: '0.0', student: '0.0', child: '0.0', senior: '0.0', joyyou60: '0.0', joyyou65: '0.0', singleAdult: '0.0', singleConc: '0.0', firstClass: null };
       }
+
+      // === [新增] 優先從 SQLite cplanner_index 讀取官方真實重鐵車費 ===
+      if (window.MTR_SQLITE_DB?.loaded) {
+        const sId = MTR_SQLITE_DB.aliasToId[origId];
+        const dId = MTR_SQLITE_DB.aliasToId[destId];
+        const rec = (sId && dId) ? (MTR_SQLITE_DB.cplanner[`${sId}_${dId}`] || MTR_SQLITE_DB.cplanner[`${dId}_${sId}`]) : null;
+        if (rec && rec.octAdult > 0) {
+          const adultStr = rec.octAdult.toFixed(1);
+          const childStr = (rec.octChild > 0 ? rec.octChild : rec.octConc).toFixed(1);
+          const studentStr = (rec.octStudent > 0 ? rec.octStudent : childStr);
+          const seniorStr = (rec.octElderly > 0 ? rec.octElderly : childStr);
+          const joy60 = computeJoyYouFare(adultStr, seniorStr, origId, destId, false);
+          const joy65 = computeJoyYouFare(adultStr, seniorStr, origId, destId, true);
+
+          let fc = null;
+          const ealLeg = (legs || []).find(l => l.line === 'EAL');
+          if (ealLeg && rec.fcAdult > 0) {
+            const extraAdult = Math.max(0, rec.fcAdult - rec.octAdult);
+            const extraConc = Math.max(0, (rec.fcConc || rec.fcAdult) - rec.octConc);
+            fc = {
+              ealFrom: ealLeg.from,
+              ealTo: ealLeg.to,
+              extraAdult: extraAdult.toFixed(1),
+              extraChild: extraConc.toFixed(1),
+              adultTotal: rec.fcAdult.toFixed(1),
+              studentTotal: (parseFloat(studentStr) + extraAdult).toFixed(1),
+              childTotal: (parseFloat(childStr) + extraConc).toFixed(1),
+              seniorTotal: (parseFloat(seniorStr) + extraConc).toFixed(1),
+              joyyou60Total: (parseFloat(joy60) + extraAdult).toFixed(1),
+              joyyou65Total: (parseFloat(joy65) + extraConc).toFixed(1)
+            };
+          }
+
+          return {
+            isExact: true,
+            adult: adultStr,
+            student: String(studentStr),
+            child: childStr,
+            senior: String(seniorStr),
+            joyyou60: joy60,
+            joyyou65: joy65,
+            singleAdult: rec.singleAdult > 0 ? rec.singleAdult.toFixed(1) : null,
+            singleConc: rec.singleConc > 0 ? rec.singleConc.toFixed(1) : null,
+            firstClass: fc
+          };
+        }
+      }
+
       const k1 = `${origId}-${destId}`;
       const k2 = `${destId}-${origId}`;
       const rawEntry = importedMtrFares[k1] || importedMtrFares[k2] || STATIC_MTR_FARES[k1] || STATIC_MTR_FARES[k2] || null;
@@ -2743,6 +3261,23 @@
 
     function getFullLrtFareBreakdown(origId, destId, routeObj) {
       if (origId === destId) return { adult: '0.0', child: '0.0', student: '0.0', senior: '0.0', joyyou: '0.0' };
+      // === [新增] 優先從 SQLite lrjp_fare & lrjp_journey 讀取官方輕鐵車費與時間 ===
+      if (window.MTR_SQLITE_DB?.loaded) {
+        const cleanFrom = String(origId).replace(/^LR_/i, '').trim();
+        const cleanTo = String(destId).replace(/^LR_/i, '').trim();
+        const fareRec = MTR_SQLITE_DB.lrtFares[`${cleanFrom}_${cleanTo}`] || MTR_SQLITE_DB.lrtFares[`${cleanTo}_${cleanFrom}`];
+        if (fareRec && fareRec.octAdult > 0) {
+          return {
+            adult: fareRec.octAdult.toFixed(1),
+            child: fareRec.octConc.toFixed(1),
+            student: (fareRec.octStudent || fareRec.octConc).toFixed(1),
+            senior: (fareRec.octElderly || fareRec.octConc).toFixed(1),
+            joyyou: fareRec.octAdult <= 10.0 ? '2.0' : Math.max(2.0, Math.round(fareRec.octAdult * 0.2 * 10) / 10).toFixed(1),
+            singleAdult: fareRec.singleAdult ? fareRec.singleAdult.toFixed(1) : null,
+            singleConc: fareRec.singleConc ? fareRec.singleConc.toFixed(1) : null
+          };
+        }
+      }
       const k1 = `${origId}-${destId}`;
       const k2 = `${destId}-${origId}`;
       const imp = importedLrtFares[k1] || importedLrtFares[k2];
@@ -3483,5 +4018,20 @@
 
     refreshAll(true);
   </script>
+
+  <!-- 懸浮式：港鐵/輕鐵官方 SQLite 資料庫匯入面板 -->
+  <div id="mtrSqliteFloatingBox" style="position: fixed; bottom: 16px; right: 16px; z-index: 99999; background: #1e293b; color: #f8fafc; padding: 12px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); font-family: sans-serif; max-width: 300px; font-size: 13px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <strong style="font-size: 14px;">📦 港鐵/輕鐵 SQLite 匯入</strong>
+      <button type="button" onclick="document.getElementById('mtrSqliteFloatingBox').style.display='none'" style="background: transparent; color: #94a3b8; border: none; cursor: pointer; font-size: 14px;">✖</button>
+    </div>
+    <input type="file" id="mtrSqliteFileInput" multiple style="display:none;" onchange="handleMtrSqliteFiles(this.files)">
+    <div style="display: flex; flex-direction: column; gap: 6px;">
+      <button type="button" onclick="document.getElementById('mtrSqliteFileInput').click()" style="padding: 8px; border-radius: 6px; border: none; background: #3b82f6; color: white; font-weight: bold; cursor: pointer;">📂 1. 選取 7 個檔案匯入</button>
+      <button type="button" onclick="exportSqliteToStaticJs()" style="padding: 8px; border-radius: 6px; border: none; background: #10b981; color: white; font-weight: bold; cursor: pointer;">💾 2. 下載 mtr_sqlite_data.js</button>
+      <button type="button" onclick="clearMtrSqliteCache()" style="padding: 6px; border-radius: 6px; border: 1px solid #475569; background: transparent; color: #cbd5e1; cursor: pointer; font-size: 12px;">🗑️ 清除資料庫快取</button>
+    </div>
+    <div id="mtrSqliteStatus" style="font-size: 12px; margin-top: 8px; color: #38bdf8; line-height: 1.4;">狀態：尚未載入官方 SQLite 數據</div>
+  </div>
 </body>
 </html>
